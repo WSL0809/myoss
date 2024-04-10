@@ -1,17 +1,18 @@
 use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aes::Aes256;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
-use axum::{extract::Multipart, http::StatusCode, response::Html, routing::post, Router};
-use ctr::cipher::{KeyIvInit, StreamCipher};
-use ctr::Ctr128BE;
+use axum::{extract::Multipart, http::{StatusCode, header}, response::Html, routing::post, Router, response};
+use ctr::cipher::{KeyIvInit};
 use dotenv::dotenv;
 use futures::{stream::TryStreamExt, StreamExt};
 use hex::decode;
 use rand::{rngs::OsRng, Rng};
-use sqlx::{Pool, Sqlite};
 use std::env;
+use std::path::PathBuf;
+use axum::body::Body;
+use axum::extract::Path;
+use axum::response::{IntoResponse, Response};
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use uuid::Uuid;
 fn encrypt_data(data: &[u8]) -> Result<(Vec<u8>), &'static str> {
     let key_string = env::var("KEY").map_err(|_| "Unable to get KEY from env")?;
@@ -75,7 +76,7 @@ async fn upload_file(mut multipart: Multipart) -> Result<Html<String>, (StatusCo
         let mut stream = field.into_stream();
         while let Some(chunk) = stream.next().await {
             let data = chunk.expect("Error while reading chunk");
-            let (encrypted_data) = encrypt_data(&data).expect("Failed to encrypt data");
+            let encrypted_data = encrypt_data(&data).expect("Failed to encrypt data");
 
             writer
                 .write_all(&encrypted_data)
@@ -90,11 +91,44 @@ async fn upload_file(mut multipart: Multipart) -> Result<Html<String>, (StatusCo
     Err((StatusCode::BAD_REQUEST, "No file uploaded".into()))
 }
 
+// download file by file_path
+async fn download_file(Path(file_path): Path<String>) -> impl IntoResponse {
+    let file_path = format!("./uploads/{}", file_path);
+    let path = PathBuf::from(file_path);
+
+    match File::open(path).await {
+        Ok(mut file) => {
+            let mut buffer = Vec::new();
+            if file.read_to_end(&mut buffer).await.is_ok() {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    // 设置 Content-Type 为 octet-stream 表示二进制数据流
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(buffer))
+                    .unwrap()
+            } else {
+                // 文件读取失败
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Failed to read file"))
+                    .unwrap()
+            }
+        },
+        Err(_) => {
+            // 文件打开失败，可能是文件不存在或者路径错误
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("File not found or access denied"))
+                .unwrap()
+        }
+    }
+}
 #[tokio::main]
 async fn main() {
     dotenv().ok();
 
-    let app = Router::new().route("/upload", post(upload_file));
+    let app = Router::new().route("/upload", post(upload_file))
+        .route("/download", post(download_file));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
